@@ -31,6 +31,8 @@ nadc.lamost
   metadata discovery, product downloads, typed table parsing, and
   credential-safe diagnostics. Query-completeness limits and provisional
   sqlid retrieval interfaces are documented explicitly.
+- Support LRS and MRS spectra, including historical FITS layouts, wavelength
+  validation, plotting, and per-file batch diagnostics.
 
 nrao
 ^^^^

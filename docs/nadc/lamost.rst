@@ -138,9 +138,9 @@ The following boundaries were checked on 2026-09-14:
      - Metadata and LRS spectrum
      - Metadata is available for observation 54901214.
    * - DR8/v1.0, DR9
-     - Historical SQL
-     - Legacy pipe-delimited SQL text has offline regression samples.
-       DR9/v0 SQL can return an empty body.
+     - Historical SQL and local MRS parsing
+     - Legacy pipe-delimited SQL text and scalar FLUX/LOGLAM FITS tables
+       have offline regression samples. DR9/v0 SQL can return an empty body.
    * - DR6
      - Table discovery
      - Historical table endpoints can return non-table or service-error
@@ -385,6 +385,54 @@ not create a persistent spectrum library. Authenticated requests and streaming
 catalog downloads bypass the response cache. ``download_catalog`` can skip an
 existing destination but does not resume a partial download. No automatic
 cross-release fallback is performed.
+
+Local Spectrum Processing
+-------------------------
+
+``parse_lrs_spectrum`` reads the supported single-HDU image or two-HDU table
+layout and returns wavelength, flux, and median-filtered flux arrays for
+windows of 7 and 15 pixels, with zero padding at the edges. Unsupported
+layouts raise ``ValueError``. LRS parsing does not reject nonfinite or
+nonpositive wavelength/flux values; apply quality checks before analysis.
+``parse_mrs_spectrum`` reads the spectral-band extensions and
+returns a dictionary keyed by extension name, with ``wavelength`` and
+``flux`` arrays in each entry. Wavelengths are in angstroms; fluxes retain
+the archive file's units and normalization. Consult the FITS headers before
+interpreting them as calibrated flux.
+
+MRS tables support two explicit layouts: one row containing vector ``FLUX``
+and ``WAVELENGTH`` columns, or successive rows containing scalar ``FLUX`` and
+``LOGLAM`` pixels. Historical logarithmic wavelengths are converted using
+``10**LOGLAM`` in double precision. Coadd names such as ``COADD_B`` and exposure
+names such as ``B-83692603`` are retained. The parser does not sort pixels,
+apply a radial-velocity correction, repair observation times, or change the
+wavelength frame. Empty or unsupported extensions, mismatched arrays, ambiguous
+wavelength columns, and duplicate extension names raise ``ValueError``.
+``LOGLAM`` values must be finite, and wavelengths in either layout must be
+finite and positive. Conversion overflow or underflow to zero is rejected.
+Wavelength-value errors identify the file, extension, and first invalid pixel
+(zero-based index).
+Flux values are preserved; pixel quality selection belongs to the analysis.
+
+For several local files, ``parse_mrs_spectra`` applies the same strict parser
+and records each file's outcome:
+
+.. code-block:: python
+
+   from astroquery.nadc.lamost import parse_mrs_spectra
+
+   spectra, manifest = parse_mrs_spectra(['first.fits', 'second.fits'])
+   print(manifest['Local Path', 'Status', 'Message'])
+   for spectrum, row in zip(spectra, manifest):
+       if row['Status'] == 'COMPLETE':
+           print(list(spectrum))
+
+Both outputs preserve input order and repeated paths. A failed file has
+``Status='ERROR'``, an exception type and reason in ``Message``, and ``None``
+in the corresponding ``spectra`` entry. Successful files have
+``Status='COMPLETE'`` and an empty message. File I/O, truncated-file, and
+validation errors are recorded without stopping later files; unexpected
+exceptions propagate. No input file or pixel is repaired or discarded.
 
 Failures and Diagnostics
 ------------------------

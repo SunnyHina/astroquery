@@ -18,14 +18,14 @@ import numpy as np
 from requests import HTTPError, Request, Response, TooManyRedirects
 
 from .. import conf
-from ..core import Lamost, LamostClass
+from ..core import Lamost, LamostClass, parse_lrs_spectrum, parse_mrs_spectrum, plot_spectrum
 from astroquery.exceptions import (
     InvalidQueryError,
     LoginError,
     RemoteServiceError,
     TableParseError,
 )
-from .helpers import create_mock_response
+from .helpers import create_mock_response, write_spectrum
 
 
 class TestLamost:
@@ -1743,3 +1743,148 @@ class TestLamostDataDiscovery:
         assert result['related_obsids'] == ['101001', '101002', '201001']
         assert result['related_obsids_low'] == ['101001', '101002']
         assert result['related_obsids_medium'] == ['201001']
+
+
+class TestLamostUtilityFunctions:
+    """
+    Test spectrum parsing and plotting utilities.
+    """
+
+    @pytest.mark.parametrize('hdu_count', [1, 2])
+    def test_parse_lrs_supported_layouts(self, tmp_path, hdu_count):
+        flux = np.arange(16, dtype=np.float32)
+        wavelength = 10 ** (3.6 + np.arange(16) * 0.001)
+        if hdu_count == 1:
+            primary = fits.PrimaryHDU(data=np.array([flux, np.ones(16)]))
+            primary.header['COEFF0'] = 3.6
+            primary.header['COEFF1'] = 0.001
+            hdul = fits.HDUList([primary])
+        else:
+            spectrum = fits.BinTableHDU.from_columns([
+                fits.Column(name='flux', format='16E', array=[flux]),
+                fits.Column(name='ivar', format='16E', array=[np.ones(16)]),
+                fits.Column(name='wavelength', format='16D', array=[wavelength]),
+            ])
+            hdul = fits.HDUList([fits.PrimaryHDU(), spectrum])
+        filename = tmp_path / 'spectrum.fits'
+        hdul.writeto(filename)
+        hdul.close()
+
+        result = parse_lrs_spectrum(filename)
+
+        np.testing.assert_allclose(result[0], wavelength)
+        np.testing.assert_array_equal(result[1], flux)
+        assert result[2].shape == result[3].shape == flux.shape
+
+    @pytest.mark.parametrize('layout', [
+        'three_hdus', 'empty_primary', 'missing_coeff', 'image_extension',
+        'missing_column', 'mismatched_length',
+    ])
+    def test_parse_lrs_rejects_unsupported_layout(self, tmp_path, layout):
+        hdus = [fits.PrimaryHDU()]
+        if layout == 'three_hdus':
+            hdus.extend([fits.ImageHDU(), fits.ImageHDU()])
+        elif layout == 'missing_coeff':
+            hdus = [fits.PrimaryHDU(data=np.ones((3, 16)))]
+        elif layout == 'image_extension':
+            hdus.append(fits.ImageHDU(data=np.ones((3, 16))))
+        elif layout in {'missing_column', 'mismatched_length'}:
+            columns = [fits.Column(name='flux', format='16E', array=[np.ones(16)])]
+            if layout == 'mismatched_length':
+                columns.append(fits.Column(name='wavelength', format='8E', array=[np.ones(8)]))
+            hdus.append(fits.BinTableHDU.from_columns(columns))
+        filename = tmp_path / 'unsupported.fits'
+        with fits.HDUList(hdus) as hdul:
+            hdul.writeto(filename)
+
+        with pytest.raises(ValueError, match='(?i)(LRS|layout|COEFF|flux|spectrum)'):
+            parse_lrs_spectrum(filename)
+
+    def test_parse_lrs_spectrum_real_file(self, sample_lrs_fits):
+        wavelength, flux, smooth7, smooth15 = parse_lrs_spectrum(sample_lrs_fits)
+        with fits.open(sample_lrs_fits) as hdus:
+            np.testing.assert_array_equal(wavelength, hdus[1].data['WAVELENGTH'][0])
+            np.testing.assert_array_equal(flux, hdus[1].data['FLUX'][0])
+        assert all(isinstance(value, np.ndarray) for value in (wavelength, flux, smooth7, smooth15))
+        assert wavelength.shape == flux.shape == smooth7.shape == smooth15.shape
+        assert wavelength.size > 0
+        assert wavelength.min() > 3000 and wavelength.max() < 10000
+
+    @pytest.mark.parametrize('profile', ['spike-and-platform', 'ramp'])
+    def test_parse_lrs_spectrum_smoothing(self, tmp_path, profile):
+        if profile == 'spike-and-platform':
+            flux = np.ones(31)
+            flux[5] = 100
+            flux[10:15] = 9
+            # A five-pixel platform survives a seven-point median, but not fifteen.
+            expected7 = np.ones(31)
+            expected7[10:15] = 9
+            expected15 = np.ones(31)
+        else:
+            flux = np.arange(1., 32.)
+            # Zero padding keeps the left edge at 1 and flattens the right edge.
+            expected7 = np.r_[np.arange(1., 29.), [28.] * 3]
+            expected15 = np.r_[np.arange(1., 25.), [24.] * 7]
+        path = write_spectrum(tmp_path / 'smoothing.fits', np.arange(5000., 5031.), flux)
+        _, raw, smooth7, smooth15 = parse_lrs_spectrum(path)
+        np.testing.assert_array_equal(raw, flux)
+        np.testing.assert_array_equal(smooth7, expected7)
+        np.testing.assert_array_equal(smooth15, expected15)
+
+    def test_parse_mrs_spectrum(self, sample_mrs_fits):
+        """Test MRS FITS with multiple bands"""
+        data = parse_mrs_spectrum(sample_mrs_fits)
+
+        # Verify dict with extension names as keys
+        assert isinstance(data, dict)
+        assert set(data) == {'B', 'R'}
+
+        # Each band has 'wavelength' and 'flux'
+        for band_name, band_data in data.items():
+            assert 'wavelength' in band_data
+            assert 'flux' in band_data
+            assert isinstance(band_data['wavelength'], np.ndarray)
+            assert isinstance(band_data['flux'], np.ndarray)
+            assert len(band_data['wavelength']) > 0
+            assert len(band_data['flux']) > 0
+        with fits.open(sample_mrs_fits) as hdul:
+            for band in ('B', 'R'):
+                np.testing.assert_array_equal(data[band]['flux'], hdul[band].data['flux'][0])
+                np.testing.assert_array_equal(data[band]['wavelength'], hdul[band].data['wavelength'][0])
+
+    @pytest.mark.parametrize('resolution', ['low', 'medium'])
+    @pytest.mark.parametrize('show', [False, True])
+    def test_plot_spectrum(self, sample_lrs_fits, sample_mrs_fits, pyplot, monkeypatch, resolution, show):
+        filename = sample_lrs_fits if resolution == 'low' else sample_mrs_fits
+        display = Mock()
+        monkeypatch.setattr(pyplot, 'show', display)
+        with fits.open(filename) as hdus:
+            expected = [(hdu.name, hdu.data['WAVELENGTH'][0].copy(), hdu.data['FLUX'][0].copy()) for hdu in hdus[1:]]
+        result = plot_spectrum(filename, resolution=resolution, show=show, color='purple', linewidth=2.5)
+        if show:
+            assert result is None
+            display.assert_called_once_with()
+            figure = pyplot.gcf()
+        else:
+            assert isinstance(result, pyplot.Figure)
+            display.assert_not_called()
+            figure = result
+        assert len(figure.axes) == 1
+        axes = figure.axes[0]
+        assert len(axes.lines) == len(expected)
+        for line, (name, wavelength, flux) in zip(axes.lines, expected):
+            np.testing.assert_array_equal(line.get_xdata(), wavelength)
+            np.testing.assert_array_equal(line.get_ydata(), flux)
+            assert line.get_color() == 'purple'
+            assert line.get_linewidth() == 2.5
+            if resolution == 'medium':
+                assert line.get_label() == name
+        assert 'Wavelength' in axes.get_xlabel()
+        assert axes.get_ylabel() == 'Flux'
+        assert filename in axes.get_title()
+        if resolution == 'medium':
+            assert [label.get_text() for label in axes.get_legend().get_texts()] == [row[0] for row in expected]
+
+    def test_plot_spectrum_invalid_resolution(self, sample_lrs_fits, pyplot):
+        with pytest.raises(InvalidQueryError, match='resolution must be one of'):
+            plot_spectrum(sample_lrs_fits, resolution='high', show=False)

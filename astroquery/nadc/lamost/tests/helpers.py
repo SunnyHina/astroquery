@@ -6,6 +6,7 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import Mock
 
+from astropy.io import fits
 from astropy.table import Table
 from requests import Request, Response
 
@@ -68,6 +69,21 @@ def create_mock_response(content=None, status_code=200, content_type='text/plain
     response.close = Mock(wraps=response.close)
 
     return response
+
+
+def write_spectrum(path, wavelength, flux, *, loglam=False, obsid=101):
+    """Write either a historical MRS table or an LRS/MRS vector table."""
+    primary = fits.PrimaryHDU()
+    primary.header['OBSID'] = obsid
+    if loglam:
+        columns = [fits.Column(name='LOGLAM', format='D', array=wavelength),
+                   fits.Column(name='FLUX', format='D', array=flux)]
+    else:
+        columns = [fits.Column(name='WAVELENGTH', format=f'{len(wavelength)}D', array=[wavelength]),
+                   fits.Column(name='FLUX', format=f'{len(flux)}D', array=[flux])]
+    with fits.HDUList([primary, fits.BinTableHDU.from_columns(columns, name='COADD_B')]) as hdus:
+        hdus.writeto(path)
+    return path
 
 
 def create_table_response(records, output_format):

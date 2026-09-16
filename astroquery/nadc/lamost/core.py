@@ -45,7 +45,8 @@ from ...exceptions import InvalidQueryError, LoginError, RemoteServiceError, Tab
 from . import conf
 
 
-__all__ = ['Lamost', 'LamostClass']
+__all__ = ['Lamost', 'LamostClass',
+           'parse_lrs_spectrum', 'parse_mrs_spectrum', 'parse_mrs_spectra', 'plot_spectrum']
 
 
 _TOKEN_ENV_VARS = (
@@ -129,6 +130,40 @@ class _CsvInputter(ascii.BaseInputter):
 class _CsvReader(ascii.Csv):
     data_class = _CsvData
     inputter_class = _CsvInputter
+
+
+def _median_filter_1d_zero_padded(values, kernel_size):
+    """
+    A lightweight replacement for ``scipy.signal.medfilt`` for 1D arrays.
+
+    Astroquery avoids introducing new hard dependencies for individual modules.
+    The original implementation used ``scipy.signal.medfilt`` to provide a
+    median-filtered (robustly smoothed) spectrum. This helper replicates the key
+    behavior we rely on here:
+
+    - 1D median filter
+    - odd kernel size
+    - zero-padding at the array edges
+    """
+    kernel_size = int(kernel_size)
+    if kernel_size < 1 or kernel_size % 2 == 0:
+        raise ValueError("kernel_size must be a positive odd integer.")
+
+    values = np.asanyarray(values)
+    if values.ndim != 1:
+        raise ValueError("Only 1D inputs are supported.")
+
+    if values.size < kernel_size:
+        warnings.warn(
+            f"Input size ({values.size}) is smaller than median filter kernel_size ({kernel_size}).",
+            UserWarning
+        )
+
+    pad = kernel_size // 2
+    padded = np.pad(values, pad_width=pad, mode='constant', constant_values=0)
+    windows = np.lib.stride_tricks.sliding_window_view(padded, kernel_size)
+    filtered = np.median(windows, axis=-1)
+    return filtered.astype(values.dtype, copy=False)
 
 
 class LamostClass(BaseQuery):
@@ -2627,3 +2662,269 @@ Lamost: LamostClass = LamostClass()
 
 
 # Utility functions for FITS spectrum processing
+
+def _spectrum_table_arrays(hdu, *, allow_loglam=False):
+    """Read the named spectral arrays shared by LRS and MRS table HDUs."""
+    if not isinstance(hdu, fits.BinTableHDU) or hdu.data is None or len(hdu.data) == 0:
+        raise ValueError("Spectrum HDU must contain a nonempty binary table.")
+    columns = {name.upper() for name in hdu.columns.names}
+    loglam = allow_loglam and 'LOGLAM' in columns
+    wavelength_column = 'LOGLAM' if loglam else 'WAVELENGTH'
+    if 'FLUX' not in columns or wavelength_column not in columns:
+        raise ValueError("Spectrum table requires FLUX and WAVELENGTH (or historical MRS LOGLAM) columns.")
+    if loglam:
+        if 'WAVELENGTH' in columns:
+            raise ValueError("Spectrum table has ambiguous WAVELENGTH and LOGLAM columns.")
+        # Historical MRS files store one scalar pixel per row, including coadds.
+        flux = np.array(hdu.data['FLUX'], copy=True)
+        wavelength = np.array(hdu.data['LOGLAM'], copy=True)
+    else:
+        if len(hdu.data) != 1:
+            raise ValueError("FLUX and WAVELENGTH require one table row of vector arrays.")
+        flux = np.array(hdu.data['FLUX'][0], copy=True)
+        wavelength = np.array(hdu.data['WAVELENGTH'][0], copy=True)
+    if (flux.ndim != 1 or flux.size == 0 or flux.shape != wavelength.shape
+            or flux.dtype.kind not in 'iuf' or wavelength.dtype.kind not in 'iuf'):
+        raise ValueError(f"FLUX and {wavelength_column} must be nonempty numeric arrays of equal length.")
+    if loglam:
+        invalid = np.flatnonzero(~np.isfinite(wavelength))
+        if invalid.size:
+            first = invalid[0]
+            raise ValueError(
+                f"LOGLAM must be finite; found {invalid.size} invalid pixels, "
+                f"first at zero-based index {first}: {wavelength[first]!r}."
+            )
+        # Promote before exponentiating: float32 log wavelengths otherwise lose
+        # precision unnecessarily. Do not apply RV corrections or reorder pixels.
+        # The MRS parser checks the converted values, including overflow and
+        # underflow to zero, and reports the extension and offending pixel.
+        with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+            wavelength = 10.0 ** wavelength.astype(np.float64)
+    return wavelength, flux
+
+
+def parse_lrs_spectrum(filename):
+    """
+    Parse a low-resolution spectrum (LRS) FITS file.
+
+    This function reads a LAMOST low-resolution spectrum FITS file and extracts
+    wavelength, flux, and smoothed flux data.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the LRS FITS file.
+
+    Returns
+    -------
+    wavelength : `~numpy.ndarray`
+        Wavelength array in Angstroms.
+    flux : `~numpy.ndarray`
+        Spectrum flux array.
+    flux_smooth_7 : `~numpy.ndarray`
+        Median-filtered flux with window size 7 and zero-padded edges.
+    flux_smooth_15 : `~numpy.ndarray`
+        Median-filtered flux with window size 15 and zero-padded edges.
+
+    Raises
+    ------
+    ValueError
+        The file is neither a primary-HDU LRS image with COEFF0/COEFF1 nor
+        a two-HDU file with FLUX and WAVELENGTH table columns.
+
+    Notes
+    -----
+    This parser validates the file layout, not the scientific quality of its
+    pixels. It does not reject nonfinite or nonpositive wavelength/flux values.
+
+    Examples
+    --------
+    >>> wavelength, flux, smooth7, smooth15 = parse_lrs_spectrum('spec.fits')  # doctest: +SKIP
+    """
+    with fits.open(filename) as hdulist:
+        if len(hdulist) == 1:
+            header, scidata = hdulist[0].header, hdulist[0].data
+            if (scidata is None or scidata.ndim != 2 or not all(scidata.shape)
+                    or 'COEFF0' not in header or 'COEFF1' not in header):
+                raise ValueError("LRS primary HDU requires a flux image and COEFF0/COEFF1 header keywords.")
+            flux = scidata[0].astype(np.float32)
+            wavelength = 10 ** (float(header['COEFF0']) + np.arange(flux.size) * float(header['COEFF1']))
+        elif len(hdulist) == 2:
+            wavelength, flux = _spectrum_table_arrays(hdulist[1])
+            flux = flux.astype(np.float32)
+        else:
+            raise ValueError(
+                f"Unsupported LRS FITS layout: found {len(hdulist)} HDUs; "
+                "expected a single primary image or a primary HDU and a spectrum table."
+            )
+
+    # Apply median filtering for smoothing
+    flux_smooth_7 = _median_filter_1d_zero_padded(flux, 7)
+    flux_smooth_15 = _median_filter_1d_zero_padded(flux, 15)
+
+    return wavelength, flux, flux_smooth_7, flux_smooth_15
+
+
+def parse_mrs_spectrum(filename):
+    """
+    Parse a medium-resolution spectrum (MRS) FITS file.
+
+    This function reads a LAMOST medium-resolution spectrum FITS file which
+    contains multiple spectral bands in separate extensions. It supports
+    single-row FLUX/WAVELENGTH vectors and historical DR8/DR9 tables with
+    scalar FLUX/LOGLAM pixels in successive rows. LOGLAM is converted to
+    wavelength as ``10**LOGLAM`` in double precision. Pixel order, flux values,
+    and extension names (including coadds and individual exposures) are kept;
+    no radial-velocity or wavelength-frame correction is applied.
+    Logarithmic wavelengths must be finite and the resulting wavelengths must
+    be finite and positive. Flux quality selection is left to the caller.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the MRS FITS file.
+
+    Returns
+    -------
+    data : dict
+        Dictionary with extension names as keys, each containing:
+        - 'wavelength': wavelength array in Angstroms
+        - 'flux': spectrum flux array
+
+    Raises
+    ------
+    ValueError
+        No spectrum extensions are present, or an extension is empty, lacks
+        supported columns, has ambiguous wavelength columns, or does not have
+        the numeric array shapes described above. Duplicate extension names
+        are rejected to avoid silently losing a spectrum. Nonfinite LOGLAM or
+        nonfinite/nonpositive wavelengths, including conversion overflow or
+        underflow to zero, are rejected with extension and pixel diagnostics.
+
+    Examples
+    --------
+    >>> data = parse_mrs_spectrum('spec_mrs.fits')  # doctest: +SKIP
+    >>> for band_name, band_data in data.items():  # doctest: +SKIP
+    ...     print(f"{band_name}: {len(band_data['wavelength'])} pixels")  # doctest: +SKIP
+    """
+    data = {}
+    with fits.open(filename) as hdulist:
+        if len(hdulist) < 2:
+            raise ValueError(f"{filename}: MRS FITS requires at least one spectrum extension.")
+        for i, hdu in enumerate(hdulist[1:], 1):
+            extension_name = hdu.header.get('EXTNAME', f'Extension_{i}')
+            try:
+                wavelength, flux = _spectrum_table_arrays(hdu, allow_loglam=True)
+                invalid = np.flatnonzero(~np.isfinite(wavelength) | (wavelength <= 0))
+                if invalid.size:
+                    first = invalid[0]
+                    raise ValueError(
+                        f"Wavelengths must be finite and positive; found {invalid.size} invalid pixels, "
+                        f"first at zero-based index {first}: {wavelength[first]!r}."
+                    )
+            except ValueError as error:
+                raise ValueError(f"{filename}: extension {extension_name!r} (HDU {i}): {error}") from error
+            if extension_name in data:
+                raise ValueError(f"{filename}: duplicate spectrum extension name: {extension_name} (HDU {i}).")
+            data[extension_name] = {'wavelength': wavelength, 'flux': flux}
+    return data
+
+
+def parse_mrs_spectra(filenames):
+    """Parse local MRS files and report each file's outcome.
+
+    Parameters
+    ----------
+    filenames : iterable of str or path-like
+        Local FITS paths, in processing order.
+
+    Returns
+    -------
+    spectra : list
+        One result from `parse_mrs_spectrum` per input path, or ``None`` for
+        a failed file. Input order and repeated paths are preserved.
+    manifest : `~astropy.table.Table`
+        Columns ``Local Path``, ``Status`` (``COMPLETE`` or ``ERROR``), and
+        ``Message``. Error messages include the exception type and reason.
+        Inspect the status before using a result. An unreadable or invalid
+        file is recorded and processing continues with the next file.
+
+    Notes
+    -----
+    Only file I/O, truncated-file, and data-validation errors (``OSError``,
+    ``EOFError``, ``ValueError``) are caught. Other exceptions propagate.
+    This function does not download, modify, or repair the input files.
+    """
+    if isinstance(filenames, (str, os.PathLike)):
+        raise TypeError("filenames must be an iterable of paths, not a single path.")
+    spectra = []
+    rows = []
+    for filename in filenames:
+        try:
+            result = parse_mrs_spectrum(filename)
+        except (OSError, EOFError, ValueError) as error:
+            spectra.append(None)
+            rows.append((str(filename), 'ERROR', f'{type(error).__name__}: {error}'))
+        else:
+            spectra.append(result)
+            rows.append((str(filename), 'COMPLETE', ''))
+    manifest = Table(rows=rows or None, names=('Local Path', 'Status', 'Message'), dtype=(str, str, str))
+    return spectra, manifest
+
+
+def plot_spectrum(filename, resolution='low', show=True, **kwargs):
+    """
+    Plot a LAMOST spectrum from a FITS file.
+
+    Parameters
+    ----------
+    filename : str
+        Path to the FITS file.
+    resolution : str, optional
+        Spectral resolution: 'low' for LRS (default) or 'medium' for MRS.
+    show : bool, optional
+        If True (default), display the plot. If False, return the figure object.
+    **kwargs
+        Additional keyword arguments passed to matplotlib.pyplot.plot().
+
+    Returns
+    -------
+    fig : `~matplotlib.figure.Figure`
+        Matplotlib figure object (if ``show`` is False).
+
+    Examples
+    --------
+    >>> plot_spectrum('spec.fits', resolution='low')  # doctest: +SKIP
+    >>> plot_spectrum('spec_mrs.fits', resolution='medium', show=False)  # doctest: +SKIP
+    """
+    import matplotlib.pyplot as plt
+
+    resolution = str(resolution).strip().lower()
+    if resolution not in {'low', 'medium'}:
+        raise InvalidQueryError("resolution must be one of: low, medium.")
+
+    fig = plt.figure(figsize=(18.5, 6.5))
+
+    if resolution == 'low':
+        # Parse and plot LRS
+        wavelength, flux, _, _ = parse_lrs_spectrum(filename)
+        plt.plot(wavelength, flux, **kwargs)
+
+    elif resolution == 'medium':
+        # Parse and plot all MRS bands
+        data = parse_mrs_spectrum(filename)
+        for band_name, band_data in data.items():
+            plt.plot(band_data['wavelength'], band_data['flux'],
+                     label=band_name, **kwargs)
+        if len(data) > 1:
+            plt.legend()
+
+    plt.xlabel('Wavelength [Ångströms]')
+    plt.ylabel('Flux')
+    plt.title(f'LAMOST Spectrum: {filename}')
+
+    if show:
+        plt.show()
+        return None
+    else:
+        return fig

@@ -1,13 +1,15 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
-"""Regression cases from historical LAMOST SQL responses."""
+"""Regression cases from historical LAMOST SQL responses and MRS products."""
 
 from pathlib import Path
 
 from astropy import units as u
+from astropy.io import fits
+import numpy as np
 import pytest
 
 from astroquery.exceptions import TableParseError
-from ..core import LamostClass
+from ..core import LamostClass, parse_lrs_spectrum, parse_mrs_spectrum
 from .helpers import create_mock_response
 
 
@@ -67,3 +69,80 @@ def test_preserved_historical_sql_response(name, rows, columns):
     if name == 'med_stellar':
         assert result['gaia_source_id'][0] == '3700975728440669184'
         assert result['mobsid'][0] == '635003103R'
+
+
+@pytest.mark.parametrize('filename', ['mrs_dr8_excerpt.fits.gz', 'mrs_dr10_excerpt.fits.gz'])
+def test_real_mrs_layouts_preserve_all_extensions(filename):
+    path = DATA / filename
+    result = parse_mrs_spectrum(path)
+    with fits.open(path) as hdus:
+        assert list(result) == [hdu.name for hdu in hdus[1:]]
+        for hdu in hdus[1:]:
+            if 'LOGLAM' in hdu.columns.names:
+                expected_wave = np.power(10., np.asarray(hdu.data['LOGLAM'], dtype=float))
+                expected_flux = hdu.data['FLUX']
+            else:
+                expected_wave = hdu.data['WAVELENGTH'][0]
+                expected_flux = hdu.data['FLUX'][0]
+            np.testing.assert_array_equal(result[hdu.name]['wavelength'], expected_wave)
+            np.testing.assert_array_equal(result[hdu.name]['flux'], expected_flux)
+
+
+@pytest.mark.parametrize('layout, diagnostic', [
+    ('no_extensions', 'at least one spectrum extension'),
+    ('image', 'nonempty binary table'), ('empty', 'nonempty binary table'),
+    ('missing_flux', 'requires FLUX and WAVELENGTH'), ('missing_wave', 'requires FLUX and WAVELENGTH'),
+    ('vector_loglam', 'nonempty numeric arrays of equal length'),
+    ('scalar_wavelength', 'one table row of vector arrays'),
+    ('mismatched', 'nonempty numeric arrays of equal length'),
+    ('nonnumeric', 'nonempty numeric arrays of equal length'),
+    ('ambiguous', 'ambiguous WAVELENGTH and LOGLAM'), ('duplicate', 'duplicate spectrum extension name'),
+])
+def test_mrs_rejects_unsupported_layouts(tmp_path, layout, diagnostic):
+    columns = [fits.Column(name='FLUX', format='E', array=[1., 2.]),
+               fits.Column(name='LOGLAM', format='D', array=[3.7, 3.8])]
+    if layout == 'missing_flux':
+        columns = columns[1:]
+    elif layout == 'missing_wave':
+        columns = columns[:1]
+    elif layout == 'ambiguous':
+        columns.append(fits.Column(name='WAVELENGTH', format='D', array=[5000., 6000.]))
+    elif layout == 'scalar_wavelength':
+        columns[1] = fits.Column(name='WAVELENGTH', format='D', array=[5000., 6000.])
+    elif layout in ('vector_loglam', 'mismatched'):
+        columns[0] = fits.Column(name='FLUX', format='2E', array=[[1., 2.]])
+        columns[1] = fits.Column(name='LOGLAM', format='2D', array=[[3.7, 3.8]])
+        if layout == 'mismatched':
+            columns[1] = fits.Column(name='WAVELENGTH', format='3D', array=[[5000., 6000., 7000.]])
+    elif layout == 'nonnumeric':
+        columns[0] = fits.Column(name='FLUX', format='A', array=['a', 'b'])
+    table = fits.BinTableHDU.from_columns(columns, name='B-123')
+    if layout == 'empty':
+        table = fits.BinTableHDU(data=table.data[:0])
+    hdus = [fits.PrimaryHDU(), table]
+    if layout == 'no_extensions':
+        hdus = hdus[:1]
+    elif layout == 'image':
+        hdus[1] = fits.ImageHDU(data=np.ones(2))
+    elif layout == 'duplicate':
+        hdus.append(table.copy())
+    path = tmp_path / 'invalid.fits'
+    with fits.HDUList(hdus) as hdul:
+        hdul.writeto(path)
+    with pytest.raises(ValueError, match=diagnostic):
+        parse_mrs_spectrum(path)
+
+
+def test_historical_layout_is_mrs_only(tmp_path):
+    path = tmp_path / 'historical.fits'
+    with fits.HDUList([fits.PrimaryHDU(), fits.BinTableHDU.from_columns([
+        fits.Column(name='FLUX', format='E', array=[2., 1.]),
+        fits.Column(name='LOGLAM', format='E', array=[3.8, 3.7]),
+    ])]) as hdus:
+        hdus.writeto(path)
+    result = parse_mrs_spectrum(path)['Extension_1']
+    np.testing.assert_array_equal(result['flux'], [2., 1.])
+    assert result['wavelength'][0] > result['wavelength'][1]
+    assert result['wavelength'].dtype == np.float64
+    with pytest.raises(ValueError):
+        parse_lrs_spectrum(path)
