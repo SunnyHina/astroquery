@@ -33,6 +33,8 @@ nadc.lamost
   sqlid retrieval interfaces are documented explicitly.
 - Support LRS and MRS spectra, including historical FITS layouts, wavelength
   validation, plotting, and per-file batch diagnostics.
+- Add a tested Ca II H&K activity-index example with interpolation checks
+  and masked results for failed files.
 
 nrao
 ^^^^

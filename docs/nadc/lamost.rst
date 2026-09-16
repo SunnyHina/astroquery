@@ -136,7 +136,7 @@ The following boundaries were checked on 2026-09-14:
        return a service error; VOTable can contain invalid string declarations.
    * - DR7/v2.0
      - Metadata and LRS spectrum
-     - Metadata is available for observation 54901214.
+     - Observation 54901214 is used by the activity example below.
    * - DR8/v1.0, DR9
      - Historical SQL and local MRS parsing
      - Legacy pipe-delimited SQL text and scalar FLUX/LOGLAM FITS tables
@@ -433,6 +433,79 @@ in the corresponding ``spectra`` entry. Successful files have
 ``Status='COMPLETE'`` and an empty message. File I/O, truncated-file, and
 validation errors are recorded without stopping later files; unexpected
 exceptions propagate. No input file or pixel is repaired or discarded.
+
+One-observation Activity Example
+--------------------------------
+
+The :download:`standalone example <lamost_activity.py>` selects DR7/v2.0,
+retrieves metadata and a spectrum for observation 54901214, verifies the
+metadata and FITS ``OBSID``, and computes the dimensionless Ca II H&K index
+``S_L`` from `Zhang et al. (2022) <https://arxiv.org/abs/2209.15255>`_. It uses
+only NumPy, Astropy, and astroquery. Configure authentication as described
+above if required by the selected release.
+DR7 metadata arrives as a one-row table whose ``response`` column contains
+``what``/``data`` entries; the example explicitly converts those entries into
+named fields. ``get_metadata`` preserves that service representation.
+
+Run the downloaded script to retrieve metadata and the spectrum:
+
+.. code-block:: console
+
+   $ python lamost_activity.py
+   OBSID=54901214: S_L=0.180373854
+   Published S_L=0.18038 +/- 0.003597
+
+For an existing FITS file of the same observation (54901214), run without
+networking:
+
+.. code-block:: console
+
+   $ python lamost_activity.py --filename 54901214.fits --rv -24.78
+
+The archive RV is -24.78 km/s. The example divides the vacuum wavelengths by
+``1 + RV/c`` before applying the paper's bands: 20-Angstrom rectangular
+continua centered at 4002.20 and 3902.17 Angstroms, and triangular cores
+centered at 3969.59 and 3934.78 Angstroms with FWHM 1.09 Angstroms. It uses
+linear interpolation and trapezoidal weights, then evaluates
+``S_L = (1.8 * 8 * 1.09 / 20) * (H + K) / (R + V)``.
+
+The independently archived numerical result is ``0.1803738541038765``; the
+script checks absolute agreement within ``1e-7``. This computational tolerance
+is separate from the published measurement uncertainty ``0.003597``. The
+published central value is ``0.18038``. This is a fixed-observation example,
+not an uncertainty propagation or Mount Wilson calibration pipeline. It
+requires finite positive flux for all pixels supporting each bandpass,
+including neighbors outside the band edges that participate in interpolation.
+An edge exactly on a wavelength sample needs no extra outside neighbor.
+Invalid support pixels, RV, or nonfinite/nonpositive numerical results raise
+``ValueError`` with a reason; support-pixel errors also identify the band and
+pixel. Assess
+archive pixel masks and scientific selection criteria for other targets.
+The temporary FITS file is reserialized with Astropy header verification;
+it is not claimed to preserve the original HTTP bytes. All HDU lists and
+temporary files are closed or removed after use.
+
+To process local observations independently, import ``measure_files`` from the
+downloaded example. Supply the archive RV in km/s and expected integer OBSID
+for each file; each identity is checked before computing its index:
+
+.. code-block:: python
+
+   from lamost_activity import measure_files
+
+   manifest = measure_files([
+       ('missing.fits', -24.78, 54901214),
+       ('54901214.fits', -24.78, 54901214),
+   ])
+   print(manifest['Local Path', 'OBSID', 'Status', 'Message', 'S_L'])
+   successful = manifest[manifest['Status'] == 'COMPLETE']
+
+Like the MRS batch parser, this returns one status row per input, continues
+after file or validation errors, and propagates unexpected exceptions. Failed
+``S_L`` values are masked and displayed as ``--``. No replacement index is
+computed for a failed sample. Batch values are not compared to the fixed
+observation's reference index; the script's original single-observation command
+continues to perform that comparison.
 
 Failures and Diagnostics
 ------------------------
