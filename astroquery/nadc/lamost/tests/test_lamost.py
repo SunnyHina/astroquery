@@ -1,18 +1,21 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
 
 import pytest
+import csv
+import gzip
 import importlib
 import os
 import json
 import traceback
 from unittest.mock import Mock
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 from astropy import units as u
 from astropy.coordinates import SkyCoord
+from astropy.io import ascii, fits
 from astropy.table import Table
 import numpy as np
-from requests import HTTPError, Request, TooManyRedirects
+from requests import HTTPError, Request, Response, TooManyRedirects
 
 from .. import conf
 from ..core import Lamost, LamostClass
@@ -579,6 +582,10 @@ class TestLamostDiagnostics:
         ('query_stellar_parameters', (), {}),
         ('query_repeat_observations', (), {'obsid': '101001'}),
         ('get_metadata', ('101001',), {}),
+        ('get_spectra', ('101001',), {}),
+        ('get_images', ('101001',), {}),
+        ('get_spectrum_list', ('101001',), {}),
+        ('get_image_list', ('101001',), {}),
     ])
     def test_query_payload_redacts_token(self, method, args, kwargs):
         token = 'synthetic-lamost-token+/='
@@ -687,6 +694,33 @@ class TestLamostDiagnostics:
             assert linked is not None
             assert token not in str(linked)
             assert quote(token, safe='') not in linked.request.url
+
+    def test_oauth_stream_diagnostics_do_not_read_body(self, patch_request, tmp_path):
+        from urllib3.exceptions import ReadTimeoutError
+
+        token = 'synthetic-stream-token'
+        response = Response()
+        response.status_code = 302
+        response.request = Request('GET', 'https://example.invalid/catalog', params={'token': token}).prepare()
+        response.url = response.request.url
+        response.headers['Location'] = f'https://oauth.china-vo.org/login?token={token}'
+        response.raw = Mock()
+        response.raw.stream.side_effect = ReadTimeoutError(None, response.url, f'Interrupted token={token}')
+        response.close = Mock(wraps=response.close)
+        patch_request(response)
+        lamost = LamostClass(token=token)
+
+        with pytest.raises(LoginError) as caught:
+            lamost.download_catalog('catalog', save_dir=str(tmp_path))
+
+        response.raw.stream.assert_not_called()
+        response.close.assert_called_once()
+        response.raw.close.assert_called_once()
+        assert token not in ''.join(traceback.format_exception(caught.value))
+        assert token not in lamost.response.url
+        assert token not in lamost.response.request.url
+        assert token not in repr(dict(lamost.response.headers))
+        assert lamost.response.raw is None
 
     def test_redirect_loop_preserves_requests_error(self, monkeypatch):
         from requests.adapters import BaseAdapter
@@ -1153,6 +1187,418 @@ obsid\tra\tdec
             np.testing.assert_allclose(table[name], [row[name] for row in mock_json_response])
 
 
+class TestLamostPagination:
+    """
+    Test pagination methods for handling large query results.
+    """
+
+    def test_get_query_result_count(self, patch_request, mock_pagination_count):
+        request = patch_request(create_mock_response(json_data=mock_pagination_count))
+        count = LamostClass(token='page-token').get_query_result_count(12345, cache=False)
+        assert count == 25000
+        request.assert_called_once_with(
+            'GET', 'https://www.lamost.org/openapi/dr10/v2.0/get_query_result_count',
+            params={'sqlid': 12345, 'token': 'page-token'}, json=None, timeout=60, cache=False, stream=False,
+        )
+
+    @pytest.mark.parametrize('page', [1, 2, 3], ids=['first', 'middle', 'last-partial'])
+    @pytest.mark.parametrize('output_format', ['json', 'csv', 'votable', 'txt'])
+    def test_get_query_result_by_page(self, pagination_request, page, output_format):
+        records = [{'obsid': i, 'label': f'source-{i}', 'ra': i + .25} for i in range(8)]
+        request = pagination_request(records)
+        result = LamostClass(token='page-token').get_query_result_by_page(
+            12345, count=8, rows=3, page=page, output_format=output_format, cache=False,
+        )
+        expected = records[(page - 1) * 3:page * 3]
+        if output_format == 'json':
+            assert result == expected
+        else:
+            assert isinstance(result, Table)
+            assert result.colnames == ['obsid', 'label', 'ra']
+            assert result['obsid'].dtype.kind in 'iu'
+            assert result['ra'].dtype.kind == 'f'
+            for name in result.colnames:
+                np.testing.assert_array_equal(result[name], [row[name] for row in expected])
+        request.assert_called_once_with(
+            'GET', 'https://www.lamost.org/openapi/dr10/v2.0/get_query_result',
+            params={'sqlid': 12345, 'rows': 3, 'page': page, 'output.fmt': output_format, 'token': 'page-token'},
+            json=None, timeout=60, cache=False, stream=False,
+        )
+
+    @pytest.mark.parametrize('output_format', ['json', 'csv'])
+    def test_get_query_result_by_page_exceed(self, monkeypatch, output_format):
+        request = Mock()
+        monkeypatch.setattr(LamostClass, '_request', request)
+        result = LamostClass().get_query_result_by_page(
+            12345, count=10000, rows=100, page=1000, output_format=output_format,
+        )
+        assert isinstance(result, list if output_format == 'json' else Table)
+        assert len(result) == 0
+        request.assert_not_called()
+
+    @pytest.mark.parametrize('method', ['get_query_result_by_page', 'get_query_result'])
+    def test_pagination_fmt_alias(self, pagination_request, method):
+        records = [{'obsid': 1, 'label': 'source-1'}]
+        request = pagination_request(records)
+        kwargs = {'count': 1, 'rows': 2} if method == 'get_query_result_by_page' else {'page_size': 2}
+        result = getattr(LamostClass(), method)(12345, fmt='csv', cache=False, **kwargs)
+        assert isinstance(result, Table)
+        assert list(result['obsid']) == [1]
+        assert list(result['label']) == ['source-1']
+        assert request.call_args.kwargs['params']['output.fmt'] == 'csv'
+
+    @pytest.mark.parametrize('count', [0, 2, 5], ids=['empty', 'single-page', 'multiple-pages'])
+    @pytest.mark.parametrize('output_format', ['json', 'csv', 'votable', 'txt'])
+    def test_get_query_result_pages(self, pagination_request, count, output_format):
+        records = [{'obsid': i, 'label': f'source-{i}', 'ra': i + .25} for i in range(count)]
+        request = pagination_request(records)
+        result = LamostClass().get_query_result(12345, output_format=output_format, page_size=2, cache=False)
+        if output_format == 'json':
+            assert result == records
+        else:
+            assert isinstance(result, Table)
+            assert len(result) == count
+            if count:
+                assert result.colnames == ['obsid', 'label', 'ra']
+                assert result['obsid'].dtype.kind in 'iu'
+                assert result['ra'].dtype.kind == 'f'
+                for name in result.colnames:
+                    np.testing.assert_array_equal(result[name], [row[name] for row in records])
+        base = 'https://www.lamost.org/openapi/dr10/v2.0'
+        expected = [('/get_query_result_count', {'sqlid': 12345})]
+        expected += [('/get_query_result', {'sqlid': 12345, 'rows': 2, 'page': page, 'output.fmt': output_format})
+                     for page in range(1, (count + 1) // 2 + 1)]
+        assert [(call.args, call.kwargs) for call in request.call_args_list] == [
+            (('GET', base + endpoint), {'params': params, 'json': None, 'timeout': 60, 'cache': False, 'stream': False})
+            for endpoint, params in expected
+        ]
+
+    @pytest.mark.parametrize('kwargs', [
+        {'rows': 0}, {'rows': -1}, {'rows': 1.5}, {'rows': True},
+        {'page': 0}, {'page': -1}, {'page': 1.5},
+        {'count': -1}, {'count': 1.5},
+    ])
+    def test_invalid_pagination_parameters(self, kwargs):
+        parameters = {'count': 100, 'rows': 10, 'page': 1}
+        parameters.update(kwargs)
+        with pytest.raises(InvalidQueryError):
+            LamostClass().get_query_result_by_page(12345, **parameters)
+
+    @pytest.mark.parametrize('page_size', [0, -1, 1.5, True])
+    def test_invalid_page_size(self, page_size):
+        with pytest.raises(InvalidQueryError, match='page_size'):
+            LamostClass().get_query_result(12345, page_size=page_size)
+
+    @pytest.mark.parametrize('output_format', ['json', 'csv'])
+    def test_pagination_rejects_incomplete_results(self, monkeypatch, output_format):
+        def mock_request(self, method, url, **kwargs):
+            if url.endswith('/get_query_result_count'):
+                return create_mock_response(json_data=5)
+            if output_format == 'json':
+                return create_mock_response(json_data=[{'obsid': '1'}])
+            return create_mock_response(content=b'obsid\n1\n', content_type='text/csv')
+
+        monkeypatch.setattr(LamostClass, '_request', mock_request)
+        with pytest.raises(RemoteServiceError, match='(rows|count|complete)'):
+            LamostClass().get_query_result(12345, page_size=3, output_format=output_format)
+
+    @pytest.mark.parametrize('count', [-1, 1.5, {'total': 'invalid'}, True])
+    def test_invalid_result_count(self, patch_request, count):
+        patch_request(create_mock_response(json_data=count))
+        with pytest.raises((RemoteServiceError, TableParseError)):
+            LamostClass().get_query_result_count(12345)
+
+    @pytest.mark.parametrize('output_format', ['csv', 'json', 'votable', 'txt'])
+    @pytest.mark.parametrize('parameter', ['output_format', 'fmt'])
+    def test_download_query_result_roundtrip(self, tmp_path, monkeypatch, output_format, parameter):
+        records = [
+            {'obsid': 101001, 'designation': '00123', 'ra': 10.0, 'name': '目标 A, "blue"'},
+            {'obsid': 101002, 'designation': '00456', 'ra': 10.1, 'name': '目标 B'},
+        ]
+        query_format = 'votable' if output_format == 'votable' else 'json'
+        result = records if query_format == 'json' else Table(rows=records)
+        get_result = Mock(return_value=result)
+        monkeypatch.setattr(LamostClass, 'get_query_result', get_result)
+        monkeypatch.chdir(tmp_path)
+        filepath = tmp_path / 'results.out'
+        filepath.write_text('old result', encoding='utf-8')
+
+        saved_path = LamostClass().download_query_result(
+            12345, 'results.out', page_size=7, cache=False, **{parameter: output_format},
+        )
+
+        assert saved_path == 'results.out'
+        get_result.assert_called_once_with(12345, output_format=query_format, page_size=7, cache=False)
+        if output_format == 'csv':
+            with filepath.open(encoding='utf-8', newline='') as source:
+                reader = csv.DictReader(source)
+                assert reader.fieldnames == list(records[0])
+                assert list(reader) == [{name: str(value) for name, value in row.items()} for row in records]
+        elif output_format == 'json':
+            assert json.loads(filepath.read_text(encoding='utf-8')) == records
+        else:
+            if output_format == 'txt':
+                assert filepath.read_text(encoding='utf-8').splitlines()[0] == 'obsid\tdesignation\tra\tname'
+                decoded = Table.read(filepath, format='ascii.tab', encoding='utf-8',
+                                     converters={'designation': [ascii.convert_numpy(str)]})
+            else:
+                decoded = Table.read(filepath, format='votable')
+            assert decoded.colnames == list(records[0])
+            assert len(decoded) == len(records)
+            for name in decoded.colnames:
+                assert list(decoded[name]) == [row[name] for row in records]
+        assert set(tmp_path.iterdir()) == {filepath}
+
+    def test_txt_export_preserves_identifiers_across_pages(self, tmp_path, monkeypatch):
+        records = [
+            {'obsid': 1, 'gaia_source_id': '00123'},
+            {'obsid': 2, 'gaia_source_id': '00000'},
+            {'obsid': 3, 'gaia_source_id': '00456'},
+        ]
+        pages = []
+
+        def request(method, url, *, params, **kwargs):
+            if url.endswith('/get_query_result_count'):
+                return create_mock_response(json_data=len(records))
+            start = (params['page'] - 1) * params['rows']
+            rows = records[start:start + params['rows']]
+            pages.append(params['page'])
+            if params['output.fmt'] == 'json':
+                return create_mock_response(json_data=rows)
+            text = 'obsid\tgaia_source_id\n'
+            text += ''.join(f"{row['obsid']}\t{row['gaia_source_id']}\n" for row in rows)
+            return create_mock_response(content=text, content_type='text/plain')
+
+        client = LamostClass()
+        monkeypatch.setattr(client, '_request', request)
+        filepath = tmp_path / 'identifiers.txt'
+        client.download_query_result(12345, filepath, output_format='txt', page_size=2, cache=False)
+
+        with filepath.open(encoding='utf-8', newline='') as source:
+            exported = list(csv.DictReader(source, delimiter='\t'))
+        assert exported == [{key: str(value) for key, value in row.items()} for row in records]
+        assert pages == [1, 2]
+
+    @pytest.mark.parametrize('output_format', ['csv', 'json', 'votable', 'txt'])
+    @pytest.mark.parametrize('existing', [True, False])
+    def test_download_query_result_write_failure(self, tmp_path, monkeypatch, output_format, existing):
+        records = [{'obsid': 1}, {'obsid': 2}]
+        if output_format == 'csv':
+            records[1]['ra'] = 10.0
+        elif output_format == 'json':
+            def interrupted_json_write(data, stream, **kwargs):
+                stream.write('[{"obsid": 1},')
+                raise OSError('write interrupted')
+            monkeypatch.setattr(json, 'dump', interrupted_json_write)
+        else:
+            def interrupted_table_write(table, filename, **kwargs):
+                if hasattr(filename, 'write'):
+                    filename.write('partial table')
+                else:
+                    with open(filename, 'w', encoding='utf-8') as stream:
+                        stream.write('partial table')
+                raise OSError('write interrupted')
+            monkeypatch.setattr(Table, 'write', interrupted_table_write)
+        result = Table(rows=records) if output_format == 'votable' else records
+        monkeypatch.setattr(LamostClass, 'get_query_result', Mock(return_value=result))
+        filepath = tmp_path / 'results.out'
+        original = b'obsid\n999\n'
+        if existing:
+            filepath.write_bytes(original)
+
+        error = ValueError if output_format == 'csv' else OSError
+        with pytest.raises(error, match='fieldnames|write interrupted'):
+            LamostClass().download_query_result(12345, str(filepath), output_format=output_format)
+
+        if existing:
+            assert filepath.read_bytes() == original
+        else:
+            assert not filepath.exists()
+        assert set(tmp_path.iterdir()) == ({filepath} if existing else set())
+
+    def test_download_query_result_replace_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(LamostClass, 'get_query_result', Mock(return_value=[{'obsid': 1}]))
+        monkeypatch.setattr(os, 'replace', Mock(side_effect=PermissionError('replace denied')))
+        filepath = tmp_path / 'results.csv'
+        original = b'obsid\n999\n'
+        filepath.write_bytes(original)
+
+        with pytest.raises(PermissionError, match='replace denied'):
+            LamostClass().download_query_result(12345, str(filepath))
+
+        assert filepath.read_bytes() == original
+        assert set(tmp_path.iterdir()) == {filepath}
+
+
+class TestLamostDataRetrieval:
+    """
+    Test data retrieval methods for spectra, images, and catalogs.
+    """
+
+    def test_get_spectra_payload(self):
+        """Test get_spectra with get_query_payload=True"""
+        lamost = LamostClass()
+        payload = lamost.get_spectra('101001', resolution='low', get_query_payload=True)
+
+        assert isinstance(payload, dict)
+        assert 'obsid' in payload
+        assert payload['obsid'] == '101001'
+
+    @pytest.mark.parametrize('method, ending', [('get_spectrum_list', 'fits'), ('get_image_list', 'png')])
+    @pytest.mark.parametrize('resolution, path', [('low', 'lrs'), ('medium', 'mrs')])
+    @pytest.mark.parametrize('obsid, token', [('101001', 'test_token'), (686112127, 'synthetic-token+/=')])
+    def test_product_urls(self, method, ending, resolution, path, obsid, token):
+        client = LamostClass(token=token, data_release='dr8', sub_version='v1.0')
+        urls = getattr(client, method)(obsid, resolution=resolution)
+        assert len(urls) == 1
+        parsed = urlsplit(urls[0])
+        assert parsed.scheme == 'https'
+        assert parsed.netloc == 'www.lamost.org'
+        assert parsed.path == f'/openapi/dr8/v1.0/{path}/spectrum/{ending}'
+        assert parse_qs(parsed.query) == {'obsid': [str(obsid)], 'token': [token]}
+
+    def test_get_images_payload(self):
+        """Test get_images with get_query_payload=True"""
+        lamost = LamostClass()
+        payload = lamost.get_images('101001', resolution='low', get_query_payload=True)
+
+        assert isinstance(payload, dict)
+        assert 'obsid' in payload
+        assert payload['obsid'] == '101001'
+
+    @pytest.mark.parametrize('compressed', [False, True])
+    def test_get_spectra_downloads_fits(self, monkeypatch, mock_fits_content, compressed):
+        content = gzip.compress(mock_fits_content) if compressed else mock_fits_content
+        response = create_mock_response(content=content, content_type='application/fits')
+        request = Mock(return_value=response)
+        monkeypatch.setattr(LamostClass, '_request', request)
+
+        with conf.set_temp('timeout', 7):
+            lamost = LamostClass(token='secret_token')
+        result = lamost.get_spectra('101001', resolution='low')
+
+        assert len(result) == 1
+        with result[0] as hdul:
+            assert isinstance(hdul, fits.HDUList)
+            hdul.verify('exception')
+            np.testing.assert_array_equal(hdul[0].data, [[1, 2], [3, 4]])
+        url = Request('GET', request.call_args.args[1], params=request.call_args.kwargs.get('params')).prepare().url
+        assert urlsplit(url).path.endswith('/lrs/spectrum/fits')
+        assert parse_qs(urlsplit(url).query) == {'obsid': ['101001'], 'token': ['secret_token']}
+        assert request.call_args.kwargs['timeout'] == 7
+        assert request.call_args.kwargs['cache'] is False
+        response.close.assert_called_once()
+
+    def test_get_images_downloads_png(self, monkeypatch, mock_png_content):
+        response = create_mock_response(content=mock_png_content, content_type='image/png')
+        request = Mock(return_value=response)
+        monkeypatch.setattr(LamostClass, '_request', request)
+
+        with conf.set_temp('timeout', 7):
+            lamost = LamostClass()
+        result = lamost.get_images('101001', resolution='medium')
+
+        assert result == [mock_png_content]
+        url = Request('GET', request.call_args.args[1], params=request.call_args.kwargs.get('params')).prepare().url
+        assert urlsplit(url).path.endswith('/mrs/spectrum/png')
+        assert parse_qs(urlsplit(url).query) == {'obsid': ['101001']}
+        assert request.call_args.kwargs['timeout'] == 7
+        response.close.assert_called_once()
+
+    @pytest.mark.parametrize('kwargs, path, cache', [
+        ({'resolution': 'low'}, 'lrs', True), ({'ismed': True}, 'mrs', False),
+    ])
+    def test_get_fits_csv(self, patch_request, kwargs, path, cache):
+        content = 'wavelength,flux\n3800,1.2\n3801,1.3\n3802,1.4'
+        request = patch_request(create_mock_response(content=content, content_type='text/plain'))
+        assert LamostClass().get_fits_csv('101001', cache=cache, **kwargs) == content
+        request.assert_called_once_with(
+            'GET', f'https://www.lamost.org/openapi/dr10/v2.0/{path}/spectrum/fits2csv',
+            params={'obsid': '101001'}, json=None, timeout=60, cache=cache, stream=False,
+        )
+
+    @pytest.mark.parametrize('mode', [
+        'success', 'skip', 'http_error', 'oauth', 'iteration_error',
+        'write_error', 'invalid_fits',
+    ])
+    def test_download_catalog_closes_response(
+        self, tmp_path, monkeypatch, mock_fits_content, mode
+    ):
+        destination = tmp_path / 'catalog.fits.gz'
+        destination.write_bytes(b'existing content')
+        existing_temp = tmp_path / 'catalog.fits.gz.temp'
+        existing_temp.write_bytes(b'unrelated existing file')
+        content = gzip.compress(mock_fits_content)
+        token = 'synthetic-download-token'
+        response = create_mock_response(
+            content=b'not fits' if mode == 'invalid_fits' else content,
+            headers={'Content-Disposition': 'filename="catalog.fits.gz"'},
+            status_code=503 if mode == 'http_error' else 200,
+        )
+        if mode == 'oauth':
+            response.headers['Location'] = 'https://oauth.china-vo.org/login'
+        if mode == 'iteration_error':
+            def interrupted_stream(**kwargs):
+                yield b'partial'
+                raise OSError(f'Interrupted download token={token}')
+            response.iter_content = interrupted_stream
+        if mode == 'write_error':
+            monkeypatch.setattr('builtins.open', Mock(side_effect=OSError('Disk full')))
+        monkeypatch.setattr(LamostClass, '_request', Mock(return_value=response))
+        lamost = LamostClass(token=token)
+
+        if mode in {'success', 'skip'}:
+            result = lamost.download_catalog(
+                'catalog', save_dir=str(tmp_path), overwrite=mode != 'skip'
+            )
+            assert result == str(destination)
+        else:
+            exception = {'http_error': HTTPError, 'oauth': LoginError}.get(mode, OSError)
+            with pytest.raises(exception) as caught:
+                lamost.download_catalog('catalog', save_dir=str(tmp_path), overwrite=True)
+            assert token not in str(caught.value)
+
+        response.close.assert_called_once()
+        assert existing_temp.read_bytes() == b'unrelated existing file'
+        assert set(tmp_path.iterdir()) == {destination, existing_temp}
+        if mode == 'success':
+            assert destination.read_bytes() == content
+            with fits.open(destination) as hdul:
+                hdul.verify('exception')
+                np.testing.assert_array_equal(hdul[0].data, [[1, 2], [3, 4]])
+        else:
+            assert destination.read_bytes() == b'existing content'
+
+    @pytest.mark.parametrize('override, expected', [
+        (None, 'header_catalog.fits.gz'), ('custom.fits.gz', 'custom.fits.gz'),
+    ])
+    def test_download_catalog_filename(self, tmp_path, patch_request, mock_fits_content, override, expected):
+        content = gzip.compress(mock_fits_content)
+        response = create_mock_response(content=content, headers={
+            'Content-Disposition': 'attachment; filename="header_catalog.fits.gz"',
+        })
+        patch_request(response)
+        saved = LamostClass().download_catalog('test', save_dir=str(tmp_path), filename=override)
+        assert saved == str(tmp_path / expected)
+        assert (tmp_path / expected).read_bytes() == content
+        assert set(tmp_path.iterdir()) == {tmp_path / expected}
+        response.close.assert_called_once()
+
+    def test_download_catalog_rejects_corrupt_fits(self, tmp_path, monkeypatch):
+        response = create_mock_response(
+            content=b'not a fits product',
+            headers={'Content-Disposition': 'filename="corrupt.fits.gz"'},
+        )
+        monkeypatch.setattr(LamostClass, '_request', Mock(return_value=response))
+
+        with pytest.raises(OSError):
+            LamostClass().download_catalog('corrupt', save_dir=str(tmp_path))
+
+        assert not (tmp_path / 'corrupt.fits.gz').exists()
+        assert not (tmp_path / 'corrupt.fits.gz.temp').exists()
+        response.close.assert_called_once()
+
+
 class TestLamostDataDiscovery:
     """
     Test metadata and discovery methods.
@@ -1245,6 +1691,21 @@ class TestLamostDataDiscovery:
             'GET', 'https://www.lamost.org/openapi/dr10/v2.0/voservice/tap_url',
             params={'token': 'tap-token'}, json=None, timeout=60, cache=False, stream=False,
         )
+
+    @pytest.mark.parametrize('resolution, path', [('low', 'lrs'), ('medium', 'mrs')])
+    def test_get_footprint(self, patch_request, mock_png_content, resolution, path):
+        request = patch_request(create_mock_response(content=mock_png_content, content_type='image/png'))
+        footprint = LamostClass(token='footprint-token').get_footprint(resolution=resolution, cache=False)
+        assert footprint == mock_png_content
+        request.assert_called_once_with(
+            'GET', f'https://www.lamost.org/openapi/dr10/v2.0/{path}/footprint',
+            params={'token': 'footprint-token'}, json=None, timeout=60, cache=False, stream=False,
+        )
+
+    def test_get_footprint_invalid_resolution(self):
+        lamost = LamostClass()
+        with pytest.raises(InvalidQueryError, match="resolution must be one of"):
+            lamost.get_footprint(resolution='hi')
 
     @pytest.mark.parametrize('parameters', [{'obsid': '101001'}, {'ra': 10., 'dec': 40., 'radius': .001}])
     def test_get_unique_id(self, patch_request, parameters):

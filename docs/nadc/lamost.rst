@@ -41,7 +41,8 @@ The last example reads ``token=your-token`` from the named file only if no
 higher-priority source supplied a token. The client does not search for this
 file automatically. Authenticated requests disable response caching.
 ``conf.server`` must include the OpenAPI base path, for example
-``https://www.lamost.org/openapi``. The timeout applies to queries.
+``https://www.lamost.org/openapi``. The timeout applies to queries and data
+downloads.
 
 Basic Usage
 -----------
@@ -106,9 +107,10 @@ Data Release and Metadata
 
 Use ``get_dr_versions`` to inspect available data-release and sub-version
 combinations. The instance's ``data_release`` and ``sub_version`` select the
-archive endpoint used by query methods.
+archive endpoint used by query and data-product methods.
 ``get_tables_metadata`` returns schema metadata, ``get_tap_url`` returns a
-dictionary of TAP connection information.
+dictionary of TAP connection information, and ``get_footprint`` returns
+image bytes for the selected resolution.
 
 Release and Format Boundaries
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -133,7 +135,7 @@ The following boundaries were checked on 2026-09-14:
      - JSON/CSV are the reference table transports. Explicit SQL TXT can
        return a service error; VOTable can contain invalid string declarations.
    * - DR7/v2.0
-     - Metadata
+     - Metadata and LRS spectrum
      - Metadata is available for observation 54901214.
    * - DR8/v1.0, DR9
      - Historical SQL
@@ -282,6 +284,107 @@ mutually exclusive. Its return value is a dictionary containing
   ... )
   >>> repeat_payload["ra"], repeat_payload["dec"]
   (10.0004738, 40.9952444)
+
+Paged Query Results
+-------------------
+
+The four ``sqlid`` methods below are provisional compatibility interfaces
+requiring an externally supplied server-side query ID. The
+`LAMOST OpenAPI specification <https://www.lamost.org/openapi/openapi.yaml>`_
+reviewed on 2026-09-14 documents result retrieval but no submission endpoint
+producing such an ID. ``query_sql`` and ``query_catalog`` return parsed tables,
+not IDs. These interfaces have offline regression tests; a complete live
+count/page/export workflow has not been validated.
+
+Use ``get_query_result_count`` and ``get_query_result_by_page`` for explicit
+pagination of an externally supplied server-side ``sqlid``, or
+``get_query_result`` to fetch all pages with a fixed ``page_size``.
+Page numbers are one-based. Keep ``rows`` fixed across pages, including the
+last page, because it determines the service's page offset. A JSON page or
+aggregate returns a list of records; the other formats return an Astropy
+table. ``download_query_result`` writes the result set to a local file and
+returns its path.
+
+``download_query_result`` supports ``output_format='csv'``, ``'json'``,
+``'votable'``, and ``'txt'``. TXT exports are UTF-8 tab-separated files with a
+column-name header, readable with
+``Table.read(path, format='ascii.tab', encoding='utf-8')``.
+Each export fetches the complete result once in the required transport
+format. CSV, JSON, and TXT exports fetch JSON records to preserve character
+values such as identifiers with leading zeros; VOTable exports retain
+VOTable column metadata. Text readers can infer numeric types when reopening
+a TXT file; pass ``converters={'gaia_source_id': str}`` to ``Table.read``
+when that column must remain a string.
+For a zero-row result, JSON exports ``[]``. CSV and TXT cannot reconstruct
+column names from an empty JSON record list, so they contain no table header;
+check the result count before reopening these files as tables.
+The exporter writes to a temporary file on the destination filesystem and
+replaces the destination only after writing succeeds. A query or write
+failure preserves an existing destination and removes temporary output.
+
+Page sizes and page numbers must be positive integers; counts must be
+nonnegative integers. An invalid service count or a page length inconsistent
+with that count raises `~astroquery.exceptions.RemoteServiceError` instead
+of returning partial results. These checks cannot detect changed records
+when the service preserves the same row counts.
+
+.. doctest::
+
+  >>> count = lamost.get_query_result_count(12345)  # doctest: +SKIP
+  >>> page = lamost.get_query_result_by_page(  # doctest: +SKIP
+  ...     12345, count, rows=1000, page=1, output_format="json"
+  ... )
+  >>> results = lamost.get_query_result(  # doctest: +SKIP
+  ...     12345, output_format="json", page_size=1000
+  ... )
+  >>> path = lamost.download_query_result(  # doctest: +SKIP
+  ...     12345, "lamost-results.csv", output_format="csv"
+  ... )
+
+Data Products
+-------------
+
+Data-product methods use an observation ID and ``resolution='low'`` for LRS
+or ``resolution='medium'`` for MRS. ``get_metadata`` returns a table,
+``get_spectra`` returns a list of `~astropy.io.fits.HDUList` objects,
+``get_images`` returns a list of PNG byte strings, and ``get_fits_csv``
+returns CSV text. ``get_spectrum_list`` and ``get_image_list`` return URL
+lists without downloading files. Those URLs include the token when
+authenticated access is configured; treat them as credentials and avoid
+sharing or logging them. Their ``get_query_payload=True`` mode returns a
+redacted parameter mapping.
+
+``get_spectra`` verifies downloaded HDU lists with Astropy's ``"warn"`` mode
+by default and accepts another FITS verification option through ``verify``.
+The caller must close the HDU lists after use:
+
+.. doctest::
+
+  >>> spectra = lamost.get_spectra(176604010, resolution='low')  # doctest: +SKIP
+  >>> try:  # doctest: +SKIP
+  ...     obsid = spectra[0][0].header['OBSID']
+  ... finally:
+  ...     for spectrum in spectra:
+  ...         spectrum.close()
+
+``download_catalog`` downloads the named catalog product and returns its
+local path. It uses ``verify='exception'`` by default and replaces the
+destination only after verification with the selected option succeeds. With
+``overwrite=False``, an existing file is returned without modification or
+revalidation; the server is still contacted to resolve the filename. Failed
+writes or verification preserve an existing destination and clean up the
+unique temporary download. Some archive products fail strict verification
+even though Astropy can open them; inspect those warnings before changing
+``verify``. FITS verification checks file structure, not scientific pixel
+quality. HTTP responses are closed after downloading or skipping a product.
+
+Anonymous non-streaming requests use the inherited ``BaseQuery`` response
+cache unless ``cache=False`` is available and supplied. ``get_spectra`` and
+``get_images`` also use that response cache for anonymous requests; they do
+not create a persistent spectrum library. Authenticated requests and streaming
+catalog downloads bypass the response cache. ``download_catalog`` can skip an
+existing destination but does not resume a partial download. No automatic
+cross-release fallback is performed.
 
 Failures and Diagnostics
 ------------------------

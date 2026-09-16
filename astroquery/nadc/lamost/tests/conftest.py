@@ -7,7 +7,10 @@ and test data files used across all LAMOST test modules.
 """
 
 import pytest
+from io import BytesIO
 
+from astropy.io import fits
+import numpy as np
 
 from unittest.mock import Mock
 
@@ -176,6 +179,57 @@ def mock_dr_versions_response():
 
 
 @pytest.fixture
+def mock_pagination_count():
+    """
+    Return mock pagination count response.
+
+    Returns
+    -------
+    int
+        Total count of query results.
+    """
+    return 25000
+
+
+@pytest.fixture
+def mock_fits_content():
+    """
+    Return mock FITS file binary content.
+
+    Returns
+    -------
+    bytes
+        Minimal FITS file binary data.
+    """
+    # Create minimal FITS file in memory
+    hdu = fits.PrimaryHDU(data=np.array([[1, 2], [3, 4]]))
+    bio = BytesIO()
+    hdu.writeto(bio)
+    bio.seek(0)
+    return bio.read()
+
+
+@pytest.fixture
+def mock_png_content():
+    """
+    Return mock PNG image binary content.
+
+    Returns
+    -------
+    bytes
+        Minimal PNG file binary data (1x1 pixel black PNG).
+    """
+    # Minimal 1x1 black PNG
+    png_data = (
+        b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01'
+        b'\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00'
+        b'\x00\x0cIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4'
+        b'\x00\x00\x00\x00IEND\xaeB`\x82'
+    )
+    return png_data
+
+
+@pytest.fixture
 def patch_request(monkeypatch):
     """Set a response and return a spy for checking the actual request."""
     def setup_mock(response):
@@ -183,3 +237,22 @@ def patch_request(monkeypatch):
         monkeypatch.setattr(LamostClass, '_request', request)
         return request
     return setup_mock
+
+
+@pytest.fixture
+def pagination_request(monkeypatch):
+    """Serve count and pages using the actual page/rows request parameters."""
+    from .helpers import create_mock_response, create_table_response
+
+    def configure(records):
+        def respond(method, url, *, params, **kwargs):
+            if url.endswith('/get_query_result_count'):
+                return create_mock_response(json_data={'total': len(records)})
+            assert url.endswith('/get_query_result')
+            offset = (params['page'] - 1) * params['rows']
+            page = records[offset:offset + params['rows']]
+            return create_table_response(page, params['output.fmt'])
+        request = Mock(side_effect=respond)
+        monkeypatch.setattr(LamostClass, '_request', request)
+        return request
+    return configure

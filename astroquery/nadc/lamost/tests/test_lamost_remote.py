@@ -1,8 +1,12 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
 
 import pytest
+import numpy as np
+from io import BytesIO
+from urllib.parse import parse_qs, urlsplit
 from astropy import units as u
 from astropy.coordinates import SkyCoord
+from astropy.io import fits
 from astropy.table import Table
 
 from .. import conf
@@ -114,6 +118,33 @@ def test_get_dr_versions_remote(lamost):
     assert any(version['dr_version'] == 'dr10' and version['sub_version'] == 'v2.0' for version in result)
 
 
+@pytest.mark.filterwarnings('ignore::astropy.io.fits.verify.VerifyWarning')
+def test_get_spectra_remote(lamost, tmp_path):
+    # This archive product has extraneous NAXIS1/NAXIS2 primary-header cards.
+    lamost.cache_location = tmp_path
+    spectra = lamost.get_spectra(176604010)
+    try:
+        assert len(spectra) == 1
+        spectrum = spectra[0]
+        assert isinstance(spectrum, fits.HDUList)
+        assert len(spectrum) == 2
+        assert spectrum[0].header['OBSID'] == 176604010
+        wavelength = spectrum[1].data['WAVELENGTH'][0]
+        flux = spectrum[1].data['FLUX'][0]
+        assert wavelength.shape == flux.shape == (3909,)
+        assert np.isfinite(flux).all()
+        assert (np.diff(wavelength) > 0).all()
+        assert wavelength[0] == pytest.approx(3699.986, abs=0.01)
+        assert wavelength[-1] == pytest.approx(9099.135, abs=0.01)
+        csv_spectrum = Table.read(lamost.get_fits_csv(176604010, cache=False).splitlines(), format='ascii.csv')
+        columns = {name.lower(): name for name in csv_spectrum.colnames}
+        np.testing.assert_allclose(csv_spectrum[columns['wavelength']], wavelength, rtol=1e-5)
+        np.testing.assert_allclose(csv_spectrum[columns['flux']], flux, rtol=1e-5)
+    finally:
+        for spectrum in spectra:
+            spectrum.close()
+
+
 def test_get_metadata_and_stellar_parameters_remote(lamost):
     metadata = lamost.get_metadata(176604010, cache=False)
     assert len(metadata) == 1
@@ -133,3 +164,21 @@ def test_related_observations_remote(lamost):
     assert result['unique_id']
     assert 176604010 in list(map(int, result['related_obsids_low']))
     assert len(set(result['related_obsids_low'])) == len(result['related_obsids_low'])
+
+
+def test_product_urls_and_images_remote(lamost):
+    from PIL import Image
+
+    for method, ending in [(lamost.get_spectrum_list, 'fits'), (lamost.get_image_list, 'png')]:
+        urls = method(176604010)
+        assert len(urls) == 1
+        parsed = urlsplit(urls[0])
+        assert parsed.hostname == 'www.lamost.org'
+        assert parsed.path == f'/openapi/dr10/v2.0/lrs/spectrum/{ending}'
+        assert parse_qs(parsed.query) == {'obsid': ['176604010']}
+    images = lamost.get_images(176604010)
+    assert len(images) == 1
+    with Image.open(BytesIO(images[0])) as image:
+        assert image.format == 'PNG'
+        assert min(image.size) > 0
+        image.verify()

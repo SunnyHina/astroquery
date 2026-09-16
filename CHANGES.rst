@@ -27,9 +27,10 @@ esa.emds.einsteinprobe
 nadc.lamost
 ^^^^^^^^^^^
 
-- Add a client for the LAMOST OpenAPI with catalog and region queries,
-  metadata discovery, typed table parsing, and credential-safe diagnostics.
-  Document query-completeness limits.
+- Add a client for the LAMOST OpenAPI, with catalog and region queries,
+  metadata discovery, product downloads, typed table parsing, and
+  credential-safe diagnostics. Query-completeness limits and provisional
+  sqlid retrieval interfaces are documented explicitly.
 
 nrao
 ^^^^

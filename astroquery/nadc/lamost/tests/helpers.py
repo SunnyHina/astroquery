@@ -1,9 +1,12 @@
 # Licensed under a 3-clause BSD style license - see LICENSE.rst
 
+import csv
 import json
+from io import BytesIO, StringIO
 from pathlib import Path
 from unittest.mock import Mock
 
+from astropy.table import Table
 from requests import Request, Response
 
 
@@ -65,3 +68,19 @@ def create_mock_response(content=None, status_code=200, content_type='text/plain
     response.close = Mock(wraps=response.close)
 
     return response
+
+
+def create_table_response(records, output_format):
+    """Serialize a server page independently of the client's response parser."""
+    if output_format == 'json':
+        return create_mock_response(json_data=records)
+    if output_format == 'votable':
+        stream = BytesIO()
+        Table(rows=records).write(stream, format='votable')
+        return create_mock_response(content=stream.getvalue(), content_type='application/x-votable+xml')
+    stream = StringIO(newline='')
+    writer = csv.DictWriter(stream, fieldnames=list(records[0]), delimiter=',' if output_format == 'csv' else '\t')
+    writer.writeheader()
+    writer.writerows(records)
+    content_type = 'text/csv' if output_format == 'csv' else 'text/plain'
+    return create_mock_response(content=stream.getvalue(), content_type=content_type)

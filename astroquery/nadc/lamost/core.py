@@ -12,6 +12,7 @@ from copy import copy
 import csv
 import os
 import re
+import tempfile
 import warnings
 from io import BytesIO, StringIO
 from numbers import Integral
@@ -20,7 +21,7 @@ from urllib.parse import quote, quote_plus
 # Third party
 import astropy.units as u
 import astropy.coordinates as coord
-from astropy.io import ascii, votable
+from astropy.io import ascii, fits, votable
 from astropy.io.votable.exceptions import W46
 from astropy.table import MaskedColumn, Table
 import numpy as np
@@ -136,14 +137,15 @@ class LamostClass(BaseQuery):
 
     The LAMOST (Large Sky Area Multi-Object Fiber Spectroscopic Telescope)
     survey provides spectroscopic data for millions of stars and galaxies.
-    This class provides methods to query the catalog and access metadata.
+    This class provides methods to query the catalog, download spectra,
+    and access metadata.
 
     Notes
     -----
     Configuration is read when an instance is created, including the
     module-level ``Lamost`` instance at import time. Changing ``conf`` does
     not update existing instances. Create a new `LamostClass` to apply it.
-    Authenticated requests bypass the disk cache.
+    Authenticated requests and streaming downloads bypass the disk cache.
     ``get_query_payload=True`` returns parameters with credentials redacted.
 
     Authentication failures raise `~astroquery.exceptions.LoginError`.
@@ -835,6 +837,306 @@ class LamostClass(BaseQuery):
         response = self._request_raise('GET', url, params=request_payload, cache=cache)
         return self._normalize_unique_id_result(self._response_json(response))
 
+    def get_query_result_count(self, sqlid, *, ismed=None, cache=True):
+        """
+        Get the total count of results for a query identified by sqlid.
+
+        This provisional compatibility interface requires an externally
+        created server-side ID. The current OpenAPI does not document an ID
+        creation workflow. A complete live pagination workflow has not been
+        validated; ``query_catalog`` has separate page-based retrieval.
+
+        Parameters
+        ----------
+        sqlid : int
+            Externally created SQL query ID. ``query_sql`` does not return one.
+        ismed : bool, optional
+            Deprecated pylamost-style parameter (unused). Included for
+            compatibility only.
+        cache : bool, optional
+            If True, cache the query result. Default is True.
+
+        Returns
+        -------
+        int
+            Total number of rows in the query result.
+
+        Examples
+        --------
+        >>> from astroquery.nadc.lamost import Lamost
+        >>> count = Lamost.get_query_result_count(12345)  # doctest: +SKIP
+        >>> print(f"Total results: {count}")  # doctest: +SKIP
+        """
+        request_payload = {'sqlid': int(sqlid)}
+
+        if self.token:
+            request_payload['token'] = self.token
+
+        # Build URL
+        url = f"{self.URL}/{self.data_release}/{self.sub_version}/get_query_result_count"
+        response = self._request_raise('GET', url, params=request_payload, cache=cache)
+        data = self._response_json(response)
+        total = data.get('total') if isinstance(data, Mapping) else data
+        try:
+            return self._page_integer(total, 'count', minimum=0)
+        except InvalidQueryError as error:
+            raise RemoteServiceError(
+                "LAMOST returned an invalid result count; expected a nonnegative integer."
+            ) from error
+
+    def get_query_result_by_page(self, sqlid, count, *, rows=10000, page=1,
+                                 output_format='json', fmt=None, cache=True):
+        """
+        Get a specific page of query results.
+
+        This provisional compatibility method requires an externally created
+        ``sqlid``; see `get_query_result_count` for the service limitation.
+
+        Parameters
+        ----------
+        sqlid : int
+            SQL query ID.
+        count : int
+            Total number of results (from get_query_result_count).
+        rows : int, optional
+            Positive number of rows per page. Keep this value fixed across
+            pages, including the last page. Default is 10000.
+        page : int, optional
+            Page number (1-indexed). Default is 1.
+        output_format : str, optional
+            Output format: 'json', 'csv', 'votable', or 'txt'. Default is 'json'.
+        fmt : str, optional
+            Deprecated alias for output_format.
+        cache : bool, optional
+            If True, cache the query result. Default is True.
+
+        Returns
+        -------
+        `~astropy.table.Table` or list
+            Query results for the requested page. Returns empty list/table if
+            page number exceeds total pages.
+
+        Raises
+        ------
+        astroquery.exceptions.InvalidQueryError
+            ``rows`` or ``page`` is not a positive integer, or ``count`` is
+            not a nonnegative integer.
+        astroquery.exceptions.RemoteServiceError
+            The page length disagrees with ``count`` and ``rows``. Partial
+            results are not returned.
+
+        Examples
+        --------
+        >>> from astroquery.nadc.lamost import Lamost
+        >>> count = Lamost.get_query_result_count(12345)  # doctest: +SKIP
+        >>> page1 = Lamost.get_query_result_by_page(12345, count, rows=1000, page=1)  # doctest: +SKIP
+        """
+        rows = self._page_integer(rows, 'rows')
+        page = self._page_integer(page, 'page')
+        count = self._page_integer(count, 'count', minimum=0)
+        if fmt is not None:
+            output_format = fmt
+        output_format = self._normalize_output_format(
+            output_format,
+            allowed=('json', 'csv', 'votable', 'txt'),
+        )
+
+        if page > (count // rows + (1 if count % rows else 0)):
+            # Page exceeds total pages
+            if output_format == 'json':
+                return []
+            else:
+                return Table()
+
+        request_payload = {
+            'sqlid': int(sqlid),
+            'rows': int(rows),
+            'page': int(page),
+            'output.fmt': output_format
+        }
+
+        if self.token:
+            request_payload['token'] = self.token
+
+        # Build URL
+        url = f"{self.URL}/{self.data_release}/{self.sub_version}/get_query_result"
+        response = self._request_raise('GET', url, params=request_payload, cache=cache)
+
+        # Parse based on format
+        result = self._response_json(response) if output_format == 'json' else self._parse_result(response)
+        expected = min(rows, count - (page - 1) * rows)
+        if not isinstance(result, (list, Table)) or len(result) != expected:
+            raise RemoteServiceError(
+                f"LAMOST page {page} did not contain the expected {expected} rows; "
+                "the result is incomplete or the reported count changed."
+            )
+        return result
+
+    def get_query_result(self, sqlid, *, output_format='json', fmt=None,
+                         page_size=10000, cache=True):
+        """
+        Get complete query results by automatically fetching all pages.
+
+        This is a convenience method that handles pagination automatically
+        for large result sets. It is provisional and requires an externally
+        created ``sqlid``; see `get_query_result_count` for the service limitation.
+
+        Parameters
+        ----------
+        sqlid : int
+            SQL query ID.
+        output_format : str, optional
+            Output format: 'json', 'csv', 'votable', or 'txt'. Default is 'json'.
+        fmt : str, optional
+            Deprecated alias for output_format.
+        page_size : int, optional
+            Number of rows per page. Default is 10000.
+        cache : bool, optional
+            If True, cache the query results. Default is True.
+
+        Returns
+        -------
+        `~astropy.table.Table` or list
+            Results from every page of the supplied ``sqlid``. JSON returns
+            a list of records; other formats return a table.
+
+        Raises
+        ------
+        astroquery.exceptions.RemoteServiceError
+            The service returns an invalid count or an unexpected page length.
+        astroquery.exceptions.InvalidQueryError
+            ``page_size`` is not a positive integer.
+
+        Examples
+        --------
+        >>> from astroquery.nadc.lamost import Lamost
+        >>> full_result = Lamost.get_query_result(12345)  # doctest: +SKIP
+        >>> print(f"Retrieved {len(full_result)} rows")  # doctest: +SKIP
+        """
+        page_size = self._page_integer(page_size, 'page_size')
+        if fmt is not None:
+            output_format = fmt
+        output_format = self._normalize_output_format(
+            output_format,
+            allowed=('json', 'csv', 'votable', 'txt'),
+        )
+
+        # Get total count
+        count = self._page_integer(self.get_query_result_count(sqlid, cache=cache), 'count', minimum=0)
+
+        # Calculate number of pages
+        total_pages = count // page_size + (1 if count % page_size else 0)
+
+        if output_format == 'json':
+            # For JSON, accumulate list of dicts
+            result = []
+            for page in range(1, total_pages + 1):
+                page_result = self.get_query_result_by_page(
+                    sqlid, count, rows=page_size, page=page,
+                    output_format=output_format, cache=cache
+                )
+                result.extend(page_result)
+            return result
+        else:
+            # For table formats, stack tables
+            from astropy.table import vstack
+            tables = []
+            for page in range(1, total_pages + 1):
+                page_result = self.get_query_result_by_page(
+                    sqlid, count, rows=page_size, page=page,
+                    output_format=output_format, cache=cache
+                )
+                if len(page_result) > 0:
+                    tables.append(page_result)
+
+            if len(tables) == 0:
+                return Table()
+            elif len(tables) == 1:
+                return tables[0]
+            else:
+                return vstack(tables)
+
+    def download_query_result(self, sqlid, filename, *, output_format='csv',
+                              fmt=None, page_size=10000, cache=True):
+        """
+        Download complete query results to a file.
+
+        This provisional compatibility method requires an externally created
+        ``sqlid``; see `get_query_result_count` for the service limitation.
+
+        Parameters
+        ----------
+        sqlid : int
+            SQL query ID.
+        filename : str
+            Path to save the results.
+        output_format : str, optional
+            Output format: 'csv' (default), 'json', 'votable', or 'txt'.
+            Nonempty TXT exports contain tab-separated values and a column-name header.
+        fmt : str, optional
+            Deprecated alias for output_format.
+        page_size : int, optional
+            Number of rows per page for fetching. Default is 10000.
+        cache : bool, optional
+            If True, cache the query results. Default is True.
+
+        Returns
+        -------
+        str
+            Path to the saved file.
+
+        Notes
+        -----
+        The complete result is fetched once in the required transport format.
+        CSV, JSON, and TXT exports use JSON transport to preserve character
+        values such as identifiers with leading zeros. VOTable exports use
+        VOTable transport to retain its column metadata.
+        For zero rows, JSON writes ``[]``; CSV/TXT have no column names to
+        write because their source is an empty JSON record list.
+        Output is written to a temporary file on the destination filesystem,
+        then replaces the destination after writing succeeds. A query or write
+        failure leaves an existing destination unchanged.
+
+        Examples
+        --------
+        >>> from astroquery.nadc.lamost import Lamost
+        >>> filepath = Lamost.download_query_result(12345, 'results.csv')  # doctest: +SKIP
+        """
+        import csv
+        import json
+
+        if fmt is not None:
+            output_format = fmt
+        output_format = self._normalize_output_format(
+            output_format,
+            allowed=('json', 'csv', 'votable', 'txt'),
+        )
+
+        query_format = 'votable' if output_format == 'votable' else 'json'
+        results = self.get_query_result(
+            sqlid, output_format=query_format, page_size=page_size, cache=cache
+        )
+
+        directory = os.path.dirname(os.path.abspath(filename))
+        with tempfile.TemporaryDirectory(dir=directory) as temp_dir:
+            temp_filename = os.path.join(temp_dir, 'result')
+            if output_format == 'votable':
+                results.write(temp_filename, format='votable')
+            else:
+                with open(temp_filename, 'w', newline='', encoding='utf-8') as f:
+                    if output_format == 'csv':
+                        if len(results) > 0:
+                            writer = csv.DictWriter(f, fieldnames=results[0].keys())
+                            writer.writeheader()
+                            writer.writerows(results)
+                    elif output_format == 'json':
+                        json.dump(results, f, indent=2)
+                    else:
+                        Table(rows=results).write(f, format='ascii.tab')
+            os.replace(temp_filename, filename)
+
+        return filename
+
     def get_tables_metadata(self, *, cache=True):
         """
         Get metadata for all available tables in the data release.
@@ -902,6 +1204,44 @@ class LamostClass(BaseQuery):
         url = f"{self.URL}/{self.data_release}/{self.sub_version}/voservice/tap_url"
         response = self._request_raise('GET', url, params=request_params, cache=cache)
         return self._response_json(response)
+
+    def get_footprint(self, *, resolution='low', cache=True):
+        """
+        Get the LAMOST observation footprint image.
+
+        This provides a visual representation of the sky coverage for
+        the specified resolution.
+
+        Parameters
+        ----------
+        resolution : str, optional
+            Spectral resolution: 'low' for LRS (default) or 'medium' for MRS.
+        cache : bool, optional
+            If True, cache the image. Default is True.
+
+        Returns
+        -------
+        bytes
+            Footprint image data (typically PNG or JPEG format).
+
+        Examples
+        --------
+        >>> from astroquery.nadc.lamost import Lamost
+        >>> footprint_img = Lamost.get_footprint(resolution='low')  # doctest: +SKIP
+        >>> # Save to file
+        >>> with open('footprint.png', 'wb') as f:  # doctest: +SKIP
+        ...     f.write(footprint_img)  # doctest: +SKIP
+        """
+        resolution = self._normalize_resolution(resolution)
+        request_params = {}
+
+        if self.token:
+            request_params['token'] = self.token
+
+        # Build URL
+        url = self._build_url('footprint', resolution=resolution)
+        response = self._request_raise('GET', url, params=request_params, cache=cache)
+        return response.content
 
     def _build_url(self, endpoint, resolution='low'):
         """
@@ -1719,6 +2059,303 @@ class LamostClass(BaseQuery):
         if get_query_payload:
             return response
         return self._parse_table_response(response, verbose=verbose)
+
+    def get_spectra(self, obsid, *, resolution='low', get_query_payload=False,
+                    verify='warn'):
+        """Download spectrum FITS data for an observation ID.
+
+        Parameters
+        ----------
+        obsid : str or int
+            Observation ID of the spectrum.
+        resolution : {"low", "medium"}, optional
+            Spectral-resolution service to query.
+        get_query_payload : bool, optional
+            Return redacted request parameters instead of fetching files.
+        verify : str, optional
+            FITS verification option passed to the ``verify`` method of the
+            `astropy.io.fits.HDUList`. Default is ``"warn"``.
+
+        Returns
+        -------
+        list of astropy.io.fits.HDUList or dict
+            In-memory FITS objects, or redacted parameters when
+            ``get_query_payload=True``. The caller must close the HDU lists.
+            HTTP responses are closed before returning.
+        """
+        url_list = self.get_spectrum_list(obsid, resolution=resolution,
+                                          get_query_payload=get_query_payload)
+        if get_query_payload:
+            return url_list
+
+        with self._request_raise('GET', url_list[0]) as response:
+            with commons.get_readable_fileobj(BytesIO(response.content), encoding='binary') as source:
+                spectrum = fits.HDUList.fromstring(source.read())
+        try:
+            spectrum.verify(verify)
+        except Exception:
+            spectrum.close()
+            raise
+        return [spectrum]
+
+    def get_spectrum_list(self, obsid, *, resolution='low', get_query_payload=False):
+        """
+        Get list of spectrum FITS file URLs without downloading.
+
+        Parameters
+        ----------
+        obsid : str or int
+            Observation ID of the spectrum.
+        resolution : str, optional
+            Spectral resolution: 'low' for LRS (default) or 'medium' for MRS.
+        get_query_payload : bool, optional
+            If True, return the request parameters dict without executing the query.
+
+        Returns
+        -------
+        list of str or dict
+            List of FITS file URLs, or redacted parameters when
+            ``get_query_payload=True``. Download URLs contain the token for
+            authenticated clients and must not be logged or shared.
+        """
+        resolution = self._normalize_resolution(resolution)
+        request_payload = {'obsid': str(obsid)}
+
+        if self.token:
+            request_payload['token'] = self.token
+
+        if get_query_payload:
+            return self._redact(request_payload)
+
+        # Build URL for FITS download
+        from urllib.parse import urlencode
+        base_url = self._build_url('spectrum/fits', resolution=resolution)
+        url = f"{base_url}?{urlencode(request_payload)}"
+
+        # Return as single-item list for consistency with get_images pattern
+        return [url]
+
+    def get_fits_csv(self, obsid, *, resolution='low', ismed=None, cache=True):
+        """
+        Get spectrum data in CSV format.
+
+        This method retrieves the spectrum data as CSV text, which is useful
+        for quick preview and data processing without downloading FITS files.
+
+        Parameters
+        ----------
+        obsid : str or int
+            Observation ID of the spectrum.
+        resolution : str, optional
+            Spectral resolution: 'low' for LRS (default) or 'medium' for MRS.
+        ismed : bool, optional
+            Deprecated pylamost-style resolution flag. If True, uses MRS.
+        cache : bool, optional
+            If True, cache the query result. Default is True.
+
+        Returns
+        -------
+        str
+            CSV-formatted spectrum data as text.
+
+        Examples
+        --------
+        >>> from astroquery.nadc.lamost import Lamost
+        >>> csv_data = Lamost.get_fits_csv('101001', resolution='low')  # doctest: +SKIP
+        >>> print(csv_data[:100])  # doctest: +SKIP
+        """
+        if ismed is not None:
+            resolution = 'medium' if ismed else 'low'
+        resolution = self._normalize_resolution(resolution)
+
+        request_payload = {'obsid': str(obsid)}
+
+        if self.token:
+            request_payload['token'] = self.token
+
+        # Build URL for CSV export
+        url = self._build_url('spectrum/fits2csv', resolution=resolution)
+        response = self._request_raise('GET', url, params=request_payload, cache=cache)
+        return response.text
+
+    def get_images(self, obsid, *, resolution='low', get_query_payload=False):
+        """Download spectrum PNG images for an observation ID.
+
+        Parameters
+        ----------
+        obsid : str or int
+            Observation ID of the spectrum.
+        resolution : {"low", "medium"}, optional
+            Spectral-resolution service to query.
+        get_query_payload : bool, optional
+            Return redacted request parameters instead of fetching files.
+
+        Returns
+        -------
+        list of bytes or dict
+            PNG image bytes, or redacted parameters when
+            ``get_query_payload=True``. HTTP responses are closed before returning.
+        """
+        url_list = self.get_image_list(obsid, resolution=resolution,
+                                       get_query_payload=get_query_payload)
+        if get_query_payload:
+            return url_list
+
+        with self._request_raise('GET', url_list[0]) as response:
+            return [response.content]
+
+    def get_image_list(self, obsid, *, resolution='low', get_query_payload=False):
+        """
+        Get list of spectrum PNG image URLs without downloading.
+
+        Parameters
+        ----------
+        obsid : str or int
+            Observation ID of the spectrum.
+        resolution : str, optional
+            Spectral resolution: 'low' for LRS (default) or 'medium' for MRS.
+        get_query_payload : bool, optional
+            If True, return the request parameters dict without executing the query.
+
+        Returns
+        -------
+        list of str or dict
+            List of PNG image URLs, or redacted parameters when
+            ``get_query_payload=True``. Download URLs contain the token for
+            authenticated clients and must not be logged or shared.
+        """
+        resolution = self._normalize_resolution(resolution)
+        request_payload = {'obsid': str(obsid)}
+
+        if self.token:
+            request_payload['token'] = self.token
+
+        if get_query_payload:
+            return self._redact(request_payload)
+
+        # Build URL for PNG download
+        from urllib.parse import urlencode
+        base_url = self._build_url('spectrum/png', resolution=resolution)
+        url = f"{base_url}?{urlencode(request_payload)}"
+
+        # Return as single-item list
+        return [url]
+
+    def _resolve_download_path(self, response, save_dir, filename, default_name):
+        import os
+        import re
+
+        if filename:
+            if os.path.isabs(filename):
+                return filename
+            return os.path.join(save_dir, filename)
+
+        content_disp = response.headers.get('Content-Disposition', '')
+        filename_match = re.search(r'filename=([^;]+)', content_disp, re.IGNORECASE)
+        if filename_match:
+            resolved = filename_match.group(1).strip(' "\'')
+            resolved = os.path.basename(resolved)
+        else:
+            resolved = default_name
+
+        return os.path.join(save_dir, resolved)
+
+    def download_catalog(self, catalog_name, *, resolution='low',
+                         save_dir='./', savedir=None, ismed=None,
+                         filename=None, overwrite=True, cache=True,
+                         verify='exception'):
+        """
+        Download a catalog FITS product.
+
+        Parameters
+        ----------
+        catalog_name : str
+            Name of the catalog to download.
+        resolution : str, optional
+            Spectral resolution: 'low' for LRS (default) or 'medium' for MRS.
+        save_dir : str, optional
+            Directory to save the downloaded file. Default is current directory.
+        savedir : str, optional
+            Deprecated alias for save_dir.
+        ismed : bool, optional
+            Deprecated pylamost-style resolution flag. If True, uses MRS.
+        filename : str, optional
+            Override the output filename. Relative paths are resolved against
+            save_dir. If None, use server-provided filename and fall back to
+            "{catalog_name}.fits.gz".
+        overwrite : bool, optional
+            If True, overwrite existing file. Default is True.
+        cache : bool, optional
+            Retained for compatibility. Streaming downloads bypass the cache.
+        verify : str, optional
+            FITS verification option passed to
+            the ``verify`` method of `astropy.io.fits.HDUList`. The default, ``"exception"``,
+            rejects non-compliant catalog products before publication.
+
+        Returns
+        -------
+        str
+            Path to the downloaded catalog file, or the existing file when
+            ``overwrite=False``. Existing files are not revalidated in this case.
+
+        Notes
+        -----
+        The response is closed on success, skip, and failure. A temporary file
+        with a unique name is validated before replacing the destination;
+        a failed write or FITS
+        verification preserves an existing destination.
+
+        Examples
+        --------
+        >>> from astroquery.nadc.lamost import Lamost
+        >>> filepath = Lamost.download_catalog('catalog_v1', resolution='low')  # doctest: +SKIP
+        """
+        if savedir is not None:
+            save_dir = savedir
+
+        if ismed is not None:
+            resolution = 'medium' if ismed else 'low'
+        resolution = self._normalize_resolution(resolution)
+
+        request_params = {'name': catalog_name}
+
+        if self.token:
+            request_params['token'] = self.token
+
+        # Build URL
+        url = self._build_url('catalog', resolution=resolution)
+
+        # Download file
+        with self._request_raise(
+            'GET',
+            url,
+            params=request_params,
+            cache=cache,
+            stream=True,
+        ) as response:
+            filepath = self._resolve_download_path(
+                response, save_dir, filename, f"{catalog_name}.fits.gz"
+            )
+            os.makedirs(os.path.dirname(filepath) or save_dir, exist_ok=True)
+            if os.path.exists(filepath) and not overwrite:
+                return filepath
+
+            try:
+                directory = os.path.dirname(os.path.abspath(filepath))
+                with tempfile.TemporaryDirectory(dir=directory) as temp_dir:
+                    temp_filepath = os.path.join(temp_dir, 'catalog')
+                    with open(temp_filepath, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    with fits.open(temp_filepath) as hdul:
+                        hdul.verify(verify)
+                    os.replace(temp_filepath, filepath)
+            except Exception as error:
+                self._sanitize_exception(error)
+                raise
+
+        return filepath
 
     def _parse_result(self, response, *, verbose=False, column_schema=None):
         """
