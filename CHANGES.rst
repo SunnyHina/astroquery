@@ -24,6 +24,13 @@ esa.emds.einsteinprobe
 
 - New module to access the ESA Einstein Probe Science Archive. [#3511]
 
+nadc.lamost
+^^^^^^^^^^^
+
+- Add a client for the LAMOST OpenAPI with catalog and region queries,
+  metadata discovery, typed table parsing, and credential-safe diagnostics.
+  Document query-completeness limits.
+
 nrao
 ^^^^
 
