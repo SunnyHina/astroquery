@@ -24,6 +24,18 @@ esa.emds.einsteinprobe
 
 - New module to access the ESA Einstein Probe Science Archive. [#3511]
 
+nadc.lamost
+^^^^^^^^^^^
+
+- Add a LAMOST archive client with catalog and region queries, SQL-backed
+  spatial filtering and nearest matches, legacy metadata and DR3 downloads,
+  typed table parsing, related-observation lookup, and credential-safe diagnostics.
+- Support LRS and MRS spectra, including historical FITS layouts, wavelength
+  validation, and unmodified flux arrays. Include local export, plotting, and
+  batch-processing examples.
+- Add a tested Ca II H&K activity-index example with interpolation checks
+  and masked results for failed files.
+
 nrao
 ^^^^
 
